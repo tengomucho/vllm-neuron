@@ -286,6 +286,27 @@ def _model_dtype(hf_config: PretrainedConfig) -> torch.dtype:
     return dtype if dtype in (torch.bfloat16, torch.float16) else torch.bfloat16
 
 
+def _model_kwargs(hf_config: PretrainedConfig) -> dict:
+    """The implementation kwargs of ``from_config`` and ``from_pretrained``."""
+    kwargs = {"attn_implementation": ATTN_IMPLEMENTATION}
+    text_config = hf_config.get_text_config()
+    num_experts = next(
+        (
+            getattr(text_config, name)
+            for name in ("num_experts", "num_local_experts", "n_routed_experts")
+            if getattr(text_config, name, None)
+        ),
+        0,
+    )
+    if num_experts:
+        # Mixture of experts: gather each token's expert weights and run a
+        # batched matmul. Unlike the default grouped_mm (and its eager
+        # fallback), its shapes do not depend on the routing, so it compiles
+        # into a static graph.
+        kwargs["experts_implementation"] = "batched_mm"
+    return kwargs
+
+
 class TransformersForCausalLM(nn.Module):
     """A transformers ``*ForCausalLM`` behind the vLLM Neuron runner interface."""
 
@@ -299,7 +320,7 @@ class TransformersForCausalLM(nn.Module):
         # singleton then corrupts the dtype of every tensor it serializes.
         self.model = AutoModelForCausalLM.from_config(
             hf_config,
-            attn_implementation=ATTN_IMPLEMENTATION,
+            **_model_kwargs(hf_config),
             dtype=_model_dtype(hf_config),
         )
         self.model.eval()
@@ -370,7 +391,7 @@ class TransformersForCausalLM(nn.Module):
         self.model = AutoModelForCausalLM.from_pretrained(
             checkpoint_path,
             config=self.config,
-            attn_implementation=ATTN_IMPLEMENTATION,
+            **_model_kwargs(self.config),
             dtype=self.model.dtype,
             cache_dir=cache_dir,
         )
