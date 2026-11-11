@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import logging
 import os
 
 from .llama3 import LlamaForCausalLM
@@ -8,6 +9,8 @@ from .qwen3 import DFlashQwen3ForCausalLM, Qwen3ForCausalLM
 from .qwen3_vl import Qwen3VLForConditionalGeneration
 from .qwen3_asr import Qwen3ASRForConditionalGeneration
 from .transformers import TransformersForCausalLM
+
+logger = logging.getLogger(__name__)
 
 
 def get_models() -> list[tuple[str, type]]:
@@ -29,7 +32,8 @@ def get_models() -> list[tuple[str, type]]:
         ("Qwen3VLForConditionalGeneration", Qwen3VLForConditionalGeneration),
         ("Qwen3ASRForConditionalGeneration", Qwen3ASRForConditionalGeneration),
         # Transformers modeling backend: what vLLM resolves to with
-        # --model-impl transformers.
+        # --model-impl transformers (and for architectures it has no
+        # implementation of).
         ("TransformersForCausalLM", TransformersForCausalLM),
     ]
 
@@ -48,3 +52,35 @@ def get_models() -> list[tuple[str, type]]:
         models.append(("SyntheticStackedNeuronModel", SyntheticStackedNeuronModel))
 
     return models
+
+
+def resolve_model_cls(model_config) -> type:
+    """Resolve the class that runs ``model_config`` on Neuron.
+
+    vLLM resolves an architecture that vLLM Neuron has no implementation of to
+    vLLM's own (GPU) model class, which the Neuron runners cannot run. Serve
+    those decoder models with the Transformers modeling backend instead, as
+    vLLM does for the architectures it has no implementation of.
+    """
+    from vllm import ModelRegistry
+
+    model_cls, arch = ModelRegistry.resolve_model_cls(
+        model_config.architecture, model_config=model_config
+    )
+    if hasattr(model_cls, "from_configs") or model_config.runner_type != "generate":
+        return model_cls
+    import transformers
+
+    hf_cls = getattr(transformers, arch, None)
+    if hf_cls is not None and not hf_cls.is_backend_compatible():
+        raise ValueError(
+            f"vLLM Neuron has no implementation of {arch}, and its transformers "
+            "implementation does not support custom attention functions, which the "
+            "Transformers modeling backend needs."
+        )
+    logger.info(
+        "vLLM Neuron has no implementation of %s: serving it with the Transformers "
+        "modeling backend",
+        arch,
+    )
+    return TransformersForCausalLM

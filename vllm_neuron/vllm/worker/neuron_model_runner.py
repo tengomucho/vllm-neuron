@@ -21,7 +21,6 @@ from typing import Any, NamedTuple, cast
 
 import numpy as np
 import torch
-from vllm import ModelRegistry
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
@@ -1827,10 +1826,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         """Load the NeuronModel."""
         logger.info("Starting NeuronModel loading process")
 
-        model_cls, _ = ModelRegistry.resolve_model_cls(
-            self.vllm_config.model_config.architecture,
-            model_config=self.vllm_config.model_config,
-        )
+        from vllm_neuron.model.registry import resolve_model_cls
+
+        model_cls = resolve_model_cls(self.vllm_config.model_config)
 
         # TODO: validate and ensure all vLLM configs are complied to
 

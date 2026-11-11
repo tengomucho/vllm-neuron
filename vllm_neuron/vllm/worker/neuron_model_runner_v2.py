@@ -592,8 +592,6 @@ class NeuronModelRunnerV2:
         V1). A synthetic model short-circuits weight loading for off-device
         execution.
         """
-        from vllm import ModelRegistry
-
         model_config = self.vllm_config.model_config
         if model_config.runner_type != "generate":
             raise ValueError(
@@ -608,9 +606,9 @@ class NeuronModelRunnerV2:
         self._submitted_forward_keepalive = None
         self.capture_backend_model = None
 
-        model_cls, _ = ModelRegistry.resolve_model_cls(
-            model_config.architecture, model_config=model_config
-        )
+        from vllm_neuron.model.registry import resolve_model_cls
+
+        model_cls = resolve_model_cls(model_config)
 
         from vllm_neuron.model.synthetic import SyntheticNeuronModel
 
