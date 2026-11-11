@@ -216,12 +216,26 @@ def _shard_for_tensor_parallel(model: nn.Module, tp_group) -> None:
     """
     rank, tp_size = tp_group.rank_in_group, tp_group.world_size
     text_config = model.config.get_text_config()
-    for name in ("num_attention_heads", "num_key_value_heads"):
-        value = getattr(text_config, name, None)
-        if value is not None and value % tp_size:
+    num_heads = text_config.num_attention_heads
+    num_kv_heads = getattr(text_config, "num_key_value_heads", None) or num_heads
+    head_dim = getattr(text_config, "head_dim", None) or (
+        text_config.hidden_size // num_heads
+    )
+    if num_heads % tp_size:
+        raise NotImplementedError(
+            f"num_attention_heads={num_heads} is not divisible by "
+            f"tensor_parallel_size={tp_size}"
+        )
+    # With fewer KV heads than ranks, replicate them, as vLLM does: each rank
+    # keeps the KV head its query heads attend with.
+    kv_replicas = 1
+    if num_kv_heads % tp_size:
+        if tp_size % num_kv_heads:
             raise NotImplementedError(
-                f"{name}={value} is not divisible by tensor_parallel_size={tp_size}"
+                f"num_key_value_heads={num_kv_heads} and "
+                f"tensor_parallel_size={tp_size} must divide one another"
             )
+        kv_replicas = tp_size // num_kv_heads
     tp_plan = getattr(text_config, "base_model_tp_plan", None) or {}
     if not tp_plan:
         raise NotImplementedError(
@@ -243,12 +257,19 @@ def _shard_for_tensor_parallel(model: nn.Module, tp_group) -> None:
             raise NotImplementedError(
                 f"Tensor-parallel style {style!r} of {name} ({type(module).__name__})"
             )
-        if style == "colwise":
-            _shard_colwise(module, rank, tp_size)
-        else:
-            parent_name, _, attr = name.rpartition(".")
-            parent = base_model.get_submodule(parent_name)
+        parent_name, _, attr = name.rpartition(".")
+        parent = base_model.get_submodule(parent_name)
+        if style == "rowwise":
             setattr(parent, attr, _RowParallelLinear(module, rank, tp_size, tp_group))
+        elif (
+            kv_replicas > 1
+            and type(parent).__name__.endswith("Attention")
+            and module.out_features == num_kv_heads * head_dim
+        ):
+            # A k/v projection: keep the one KV head of this rank.
+            _shard_colwise(module, rank // kv_replicas, num_kv_heads)
+        else:
+            _shard_colwise(module, rank, tp_size)
 
 
 def _model_dtype(hf_config: PretrainedConfig) -> torch.dtype:
