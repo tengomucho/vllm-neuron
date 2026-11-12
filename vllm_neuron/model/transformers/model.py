@@ -17,6 +17,8 @@ Prototype scope:
 - causal attention, optionally sliding-window, soft-capped, or with attention
   sinks, computed with PyTorch ops (no NKI kernels): the KV cache of a
   sequence is gathered from its block table on each decode step;
+- LFM2-style hybrids, whose short-convolution layers keep their state in a
+  paged cache too;
 - mixture of experts, with the experts sharded over the ranks.
 """
 
@@ -37,9 +39,9 @@ ATTN_IMPLEMENTATION = "neuron_paged"
 EXPERTS_IMPLEMENTATION = "neuron"
 
 
-def _layer_name(layer_idx: int) -> str:
+def _layer_name(layer_idx: int, kind: str = "self_attn") -> str:
     # The name the runner keys attn_metadata and the KV caches by.
-    return f"layers.{layer_idx}.self_attn"
+    return f"layers.{layer_idx}.{kind}"
 
 
 def _write_kv(
@@ -179,6 +181,88 @@ def neuron_paged_attention_forward(
 
 
 AttentionInterface.register(ATTN_IMPLEMENTATION, neuron_paged_attention_forward)
+
+
+def _is_short_conv(module: nn.Module) -> bool:
+    """An LFM2-style gated short convolution: ``in_proj`` -> B, C, x; ``C * conv(B * x)``."""
+    return (
+        getattr(module, "layer_idx", None) is not None
+        and isinstance(getattr(module, "conv", None), nn.Conv1d)
+        and isinstance(getattr(module, "in_proj", None), nn.Linear)
+        and isinstance(getattr(module, "out_proj", None), nn.Module)
+    )
+
+
+class _PagedShortConv(nn.Module):
+    """An LFM2 short convolution whose state lives in the paged cache.
+
+    The transformers module keeps a per-sequence conv state (the last
+    ``kernel_size - 1`` inputs of the convolution). Here, each token's
+    convolution input ``B * x`` is written to a key-only paged cache instead, at
+    the token's slot, as attention writes its keys. Each token then reads its
+    ``kernel_size`` window (its predecessors and itself) back through its
+    sequence's block table. Prefill, segmented prefill and batched decode all
+    take this one path, and the cache is managed by vLLM like a KV cache.
+    """
+
+    def __init__(self, short_conv: nn.Module):
+        super().__init__()
+        self.layer_idx = short_conv.layer_idx
+        self.in_proj = short_conv.in_proj
+        self.conv = short_conv.conv
+        self.out_proj = short_conv.out_proj
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        neuron_attn_metadata: dict | None = None,
+        neuron_positions: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        meta = neuron_attn_metadata[_layer_name(self.layer_idx, "conv")]
+        b, c, x = self.in_proj(hidden_states[0]).chunk(3, dim=-1)  # [T, W] each
+        bx = b * x
+        num_tokens, width = bx.shape
+
+        cache = self.conv_cache  # [num_blocks, 1, block_size, W]
+        num_blocks, block_size = cache.shape[0], meta["block_size"]
+        block_indices, position_indices = paged_slot_indices(
+            meta["slot_mapping"], block_size, num_blocks
+        )
+        _write_kv(cache, bx.view(1, 1, num_tokens, width), block_indices, position_indices)
+
+        block_table = meta["block_table_tensor"]
+        if meta["max_query_len"] <= meta["decode_token_threshold"]:
+            # Decode: the tokens of each sequence are contiguous, one row each.
+            seq_len = num_tokens // block_table.shape[0]
+            seq = torch.arange(num_tokens, device=bx.device) // seq_len
+        else:
+            # A prefill step schedules a single sequence.
+            seq = torch.zeros(num_tokens, dtype=torch.long, device=bx.device)
+        kernel_size = self.conv.kernel_size[0]
+        offsets = torch.arange(kernel_size - 1, -1, -1, device=bx.device)
+        window_pos = neuron_positions.view(-1, 1) - offsets  # [T, K]: p-K+1 .. p
+        valid = window_pos >= 0
+        window_pos = window_pos.clamp(min=0)
+        blocks = block_table[seq.unsqueeze(1), window_pos // block_size].to(torch.long)
+        # Unused block-table entries hold -1; their positions are not read.
+        slots = torch.where(blocks < 0, 0, blocks) * block_size + window_pos % block_size
+        window = cache.view(-1, width).index_select(0, slots.reshape(-1))
+        window = window.view(num_tokens, kernel_size, width) * valid.unsqueeze(-1)
+
+        weight = self.conv.weight[:, 0, :]  # [W, K], depthwise
+        out = (window.to(weight.dtype) * weight.t().unsqueeze(0)).sum(1)
+        if self.conv.bias is not None:
+            out = out + self.conv.bias
+        return self.out_proj(c * out.to(c.dtype)).unsqueeze(0)
+
+
+def _use_paged_short_convs(model: nn.Module) -> None:
+    """Replace the short convolutions of ``model`` with ``_PagedShortConv``."""
+    for name, module in list(model.named_modules()):
+        if _is_short_conv(module) and not isinstance(module, _PagedShortConv):
+            parent_name, _, attr = name.rpartition(".")
+            setattr(model.get_submodule(parent_name), attr, _PagedShortConv(module))
 
 
 def neuron_experts_forward(
@@ -444,29 +528,45 @@ class TransformersForCausalLM(nn.Module):
     ):
         return cls(hf_config, neuron_config)
 
-    def _attention_layers(self) -> dict[int, nn.Module]:
-        """The modules that call the attention function, by layer index."""
+    def _cache_layers(self) -> dict[int, nn.Module]:
+        """The modules that keep a paged cache, by layer index: one per decoder
+        layer, either an attention or a short convolution."""
         layers = {}
         for module in self.model.modules():
             layer_idx = getattr(module, "layer_idx", None)
-            if layer_idx is not None and type(module).__name__.endswith("Attention"):
+            if layer_idx is not None and (
+                type(module).__name__.endswith("Attention") or _is_short_conv(module)
+            ):
                 layers[layer_idx] = module
         num_layers = self.config.get_text_config().num_hidden_layers
         if sorted(layers) != list(range(num_layers)):
             raise ValueError(
-                f"Found attention layers {sorted(layers)} in {type(self.model).__name__}, "
-                f"expected one per decoder layer (0..{num_layers - 1})."
+                f"Found attention or short-conv layers {sorted(layers)} in "
+                f"{type(self.model).__name__}, expected one per decoder layer "
+                f"(0..{num_layers - 1})."
             )
         return layers
 
     def get_kv_spec(self) -> KVSpec:
         text_config = self.config.get_text_config()
         layers = []
-        for layer_idx, attn in sorted(self._attention_layers().items()):
-            head_dim = getattr(attn, "head_dim", None) or (
+        for layer_idx, module in sorted(self._cache_layers().items()):
+            if _is_short_conv(module):
+                # One key-only vector per token: the convolution input B * x.
+                layers.append(
+                    LayerSpec(
+                        name=_layer_name(layer_idx, "conv"),
+                        num_kv_heads=1,
+                        head_size=module.conv.in_channels,
+                        dtype=self.model.dtype,
+                        key_only=True,
+                    )
+                )
+                continue
+            head_dim = getattr(module, "head_dim", None) or (
                 text_config.hidden_size // text_config.num_attention_heads
             )
-            k_proj = getattr(attn, "k_proj", None)
+            k_proj = getattr(module, "k_proj", None)
             if isinstance(k_proj, nn.Linear):
                 num_kv_heads = k_proj.out_features // head_dim
             else:
@@ -486,8 +586,11 @@ class TransformersForCausalLM(nn.Module):
         return KVSpec(layers=layers)
 
     def bind_kv_cache(self, kv_caches: dict[str, list[torch.Tensor]]) -> None:
-        for layer_idx, attn in self._attention_layers().items():
-            attn.k_cache, attn.v_cache = kv_caches[_layer_name(layer_idx)]
+        for layer_idx, module in self._cache_layers().items():
+            if _is_short_conv(module):
+                (module.conv_cache,) = kv_caches[_layer_name(layer_idx, "conv")]
+            else:
+                module.k_cache, module.v_cache = kv_caches[_layer_name(layer_idx)]
 
     def load_weights(
         self, checkpoint_path: str, device: torch.device, cache_dir: str | None
@@ -505,6 +608,7 @@ class TransformersForCausalLM(nn.Module):
         tp_group = get_tp_group()
         if tp_group.world_size > 1:
             _shard_for_tensor_parallel(self.model, tp_group)
+        _use_paged_short_convs(self.model)
 
     @torch.no_grad()
     def forward(
