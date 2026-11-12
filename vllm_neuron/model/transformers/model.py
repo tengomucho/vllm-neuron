@@ -25,6 +25,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import AttentionInterface, AutoModelForCausalLM, PretrainedConfig
+from transformers.integrations.moe import ExpertsInterface, batched_mm_experts_forward
 from vllm.distributed.parallel_state import get_tp_group
 
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, paged_slot_indices
@@ -32,6 +33,7 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.nn import Sampler
 
 ATTN_IMPLEMENTATION = "neuron_paged"
+EXPERTS_IMPLEMENTATION = "neuron"
 
 
 def _layer_name(layer_idx: int) -> str:
@@ -178,6 +180,48 @@ def neuron_paged_attention_forward(
 AttentionInterface.register(ATTN_IMPLEMENTATION, neuron_paged_attention_forward)
 
 
+def neuron_experts_forward(
+    self: nn.Module,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+) -> torch.Tensor:
+    """``ExpertsInterface`` function: gathered experts for a few tokens, all experts for many.
+
+    transformers' ``batched_mm`` gathers the weights of each (token, expert)
+    pair. That suits a decode step, but at prefill sizes the copies outgrow the
+    experts themselves: a 4096-token prefill of LFM2-24B-A2B would gather ~77
+    GB per layer at TP 4. Past half the expert count in pairs, every token goes
+    through every expert instead, as two dense matmuls, the expert outputs
+    scaled by the routing weights (zero for unrouted experts). Both paths have
+    static shapes and the choice depends on the token count only, so each
+    bucket compiles into a static graph.
+    """
+    num_tokens, top_k = top_k_index.shape
+    num_experts = self.gate_up_proj.shape[0]
+    if 2 * num_tokens * top_k <= num_experts:
+        return batched_mm_experts_forward(self, hidden_states, top_k_index, top_k_weights)
+    if not self.has_gate or self.has_bias or self.is_transposed or self.has_post_expert_norm:
+        raise NotImplementedError(
+            f"{type(self).__name__}: the dense experts path supports gated experts "
+            "without bias, transposed weights or post-expert norm"
+        )
+    # [T, H] x [E * 2I, H] -> [T, E, 2I] -> gate -> [T, E, I]
+    gate_up = F.linear(hidden_states, self.gate_up_proj.flatten(0, 1))
+    act = self._apply_gate(gate_up.view(num_tokens, num_experts, -1))
+    expert_ids = torch.arange(num_experts, device=hidden_states.device)
+    routing = (
+        (top_k_index.unsqueeze(-1) == expert_ids) * top_k_weights.unsqueeze(-1)
+    ).sum(1)  # [T, E]
+    act = act * routing.unsqueeze(-1).to(act.dtype)
+    # [T, E * I] x [H, E * I] -> [T, H]: the sum over experts is in the matmul.
+    down = self.down_proj.transpose(0, 1).flatten(1)
+    return F.linear(act.flatten(1), down).to(hidden_states.dtype)
+
+
+ExpertsInterface.register(EXPERTS_IMPLEMENTATION, neuron_experts_forward)
+
+
 class _RowParallelLinear(nn.Module):
     """An ``nn.Linear`` sharded over its input features: all-reduces its output."""
 
@@ -305,11 +349,10 @@ def _model_kwargs(hf_config: PretrainedConfig) -> dict:
         0,
     )
     if num_experts:
-        # Mixture of experts: gather each token's expert weights and run a
-        # batched matmul. Unlike the default grouped_mm (and its eager
-        # fallback), its shapes do not depend on the routing, so it compiles
-        # into a static graph.
-        kwargs["experts_implementation"] = "batched_mm"
+        # Mixture of experts: unlike the default grouped_mm (and its eager
+        # fallback), neuron_experts_forward has shapes that do not depend on
+        # the routing, so it compiles into a static graph.
+        kwargs["experts_implementation"] = EXPERTS_IMPLEMENTATION
     return kwargs
 
 
