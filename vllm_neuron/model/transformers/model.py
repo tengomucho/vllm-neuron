@@ -16,7 +16,8 @@ Prototype scope:
   ``rowwise`` linear layers; embeddings and LM head stay replicated);
 - causal attention, optionally sliding-window, soft-capped, or with attention
   sinks, computed with PyTorch ops (no NKI kernels): the KV cache of a
-  sequence is gathered from its block table on each decode step.
+  sequence is gathered from its block table on each decode step;
+- mixture of experts, with the experts sharded over the ranks.
 """
 
 import re
@@ -251,6 +252,48 @@ def _shard_colwise(linear: nn.Linear, rank: int, tp_size: int) -> None:
     linear.out_features = shard
 
 
+class _AllReduceOutput(nn.Module):
+    """Sums the partial outputs of a module sharded over its input features.
+
+    Wraps the experts of the ``moe_tp_experts`` style: each rank holds a slice
+    of every expert's intermediate features, and the routing-weighted sum over
+    experts is linear, so the partial sums only need adding once.
+    """
+
+    def __init__(self, module: nn.Module, tp_group):
+        super().__init__()
+        self.module = module
+        self.tp_group = tp_group
+
+    def forward(self, *args, **kwargs) -> torch.Tensor:
+        return self.tp_group.all_reduce(self.module(*args, **kwargs))
+
+
+def _shard_expert_param(
+    module: nn.Module, attr: str, style: str, rank: int, tp_size: int
+) -> None:
+    """Shard the 3D expert parameter ``module.<attr>``, [E, out, in] (or [E, in, out])."""
+    param = getattr(module, attr)
+    if param.dim() != 3:
+        raise NotImplementedError(f"Tensor-parallel style {style!r} of {attr} {param.shape}")
+    transposed = getattr(module, "is_transposed", False)
+    out_dim, in_dim = (-1, -2) if transposed else (-2, -1)
+    if style == "rowwise":
+        shard = param.chunk(tp_size, dim=in_dim)[rank]
+    elif style == "packed_colwise" and getattr(module, "is_concatenated", True):
+        # [gate; up]: keep this rank's slice of each half.
+        shard = torch.cat(
+            [half.chunk(tp_size, dim=out_dim)[rank] for half in param.chunk(2, dim=out_dim)],
+            dim=out_dim,
+        )
+    elif style in ("colwise", "packed_colwise"):
+        # Interleaved [gate0, up0, gate1, up1, ...] slices like colwise.
+        shard = param.chunk(tp_size, dim=out_dim)[rank]
+    else:
+        raise NotImplementedError(f"Tensor-parallel style {style!r} of {attr}")
+    setattr(module, attr, nn.Parameter(shard.contiguous(), requires_grad=False))
+
+
 def _shard_for_tensor_parallel(model: nn.Module, tp_group) -> None:
     """Shard ``model`` in place following its ``base_model_tp_plan``.
 
@@ -297,11 +340,25 @@ def _shard_for_tensor_parallel(model: nn.Module, tp_group) -> None:
         for key, style in tp_plan.items()
     ]
     base_model = model.base_model
+    # Plan entries can name parameters: the 3D weights of fused experts.
+    for name, _ in list(base_model.named_parameters()):
+        style = next((s for p, s in patterns if p.match(name)), None)
+        if style is not None:
+            module_name, _, attr = name.rpartition(".")
+            module = base_model.get_submodule(module_name)
+            _shard_expert_param(module, attr, style, rank, tp_size)
     for name, module in list(base_model.named_modules()):
         style = next((s for p, s in patterns if p.match(name)), None)
         # Replicated modules (e.g. Qwen3's per-head q/k norms) need no change
         # for inference: the gradient all-reduce only matters in training.
         if style is None or style == "replicated_with_grad_allreduce":
+            continue
+        if style == "moe_tp_experts":
+            if getattr(module, "has_bias", False):
+                raise NotImplementedError(f"Tensor-parallel experts with bias ({name})")
+            parent_name, _, attr = name.rpartition(".")
+            parent = base_model.get_submodule(parent_name)
+            setattr(parent, attr, _AllReduceOutput(module, tp_group))
             continue
         if not isinstance(module, nn.Linear) or style not in ("colwise", "rowwise"):
             raise NotImplementedError(

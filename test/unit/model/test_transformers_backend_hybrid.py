@@ -3,11 +3,19 @@
 Run:  VLLM_NEURON_CPU_MODE=1 pytest -q test/unit/model/test_transformers_backend_hybrid.py
 """
 
+import copy
+import threading
+
 import pytest
 import torch
 from transformers import AutoModelForCausalLM, Lfm2MoeConfig
 
-from vllm_neuron.model.transformers.model import neuron_experts_forward
+from vllm_neuron.model.transformers.model import (
+    _shard_for_tensor_parallel,
+    neuron_experts_forward,
+)
+
+from test_transformers_backend_tp import _ThreadGroup
 
 
 def tiny_config() -> Lfm2MoeConfig:
@@ -49,3 +57,36 @@ def test_experts_paths_match_eager(num_tokens):
     expected = type(experts).forward.__wrapped__(experts, hidden, top_k_index, top_k_weights)
     out = neuron_experts_forward(experts, hidden, top_k_index, top_k_weights)
     torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("tp_size", [2, 4])
+@torch.no_grad()
+def test_sharded_experts_logits_match(tp_size):
+    """Experts sharded with the packed_colwise/rowwise/moe_tp_experts plan."""
+    config = tiny_config()
+    reference = reference_model(config)
+    model = AutoModelForCausalLM.from_config(config, experts_implementation="neuron").eval()
+    model.load_state_dict(reference.state_dict())
+    input_ids = torch.arange(12).unsqueeze(0)
+    expected = reference(input_ids).logits
+
+    group = _ThreadGroup(tp_size)
+    outputs, errors = [None] * tp_size, []
+
+    def rank_main(rank: int) -> None:
+        try:
+            shard = copy.deepcopy(model)
+            _shard_for_tensor_parallel(shard, group.rank_view(rank))
+            outputs[rank] = shard(input_ids).logits
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+            group._barrier.abort()
+
+    threads = [threading.Thread(target=rank_main, args=(r,)) for r in range(tp_size)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=120)
+    assert not errors, errors
+    for out in outputs:
+        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
