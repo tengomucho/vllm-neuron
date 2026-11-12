@@ -236,7 +236,13 @@ def _shard_for_tensor_parallel(model: nn.Module, tp_group) -> None:
                 f"tensor_parallel_size={tp_size} must divide one another"
             )
         kv_replicas = tp_size // num_kv_heads
-    tp_plan = getattr(text_config, "base_model_tp_plan", None) or {}
+    # vLLM replaces some transformers config classes with its own (e.g.
+    # lfm2_moe), which carry no plan: fall back to the model's config class.
+    tp_plan = (
+        getattr(text_config, "base_model_tp_plan", None)
+        or getattr(model.base_model.config_class, "base_model_tp_plan", None)
+        or {}
+    )
     if not tp_plan:
         raise NotImplementedError(
             f"{type(model).__name__} has no base_model_tp_plan: tensor parallelism "
