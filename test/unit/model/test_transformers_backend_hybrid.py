@@ -55,7 +55,7 @@ def reference_model(config: Lfm2MoeConfig) -> torch.nn.Module:
 
 
 def backend_model(reference: torch.nn.Module) -> TransformersForCausalLM:
-    backend = TransformersForCausalLM(copy.deepcopy(reference.config), None)
+    backend = TransformersForCausalLM(copy.deepcopy(reference.config), None, BLOCK_SIZE)
     backend.model.float()  # the backend defaults to bf16
     backend.model.load_state_dict(reference.state_dict())
     _use_paged_short_convs(backend.model)
@@ -87,8 +87,9 @@ def step(backend, input_ids, positions, slot_mapping, block_table, max_query_len
     )
 
 
+@pytest.mark.parametrize("pad_slot", [0, -1])  # the null block (runner) or PAD_SLOT_ID
 @torch.no_grad()
-def test_prefill_then_batched_decode():
+def test_prefill_then_batched_decode(pad_slot):
     reference = reference_model(tiny_config())
     backend = backend_model(reference)
     torch.manual_seed(1)
@@ -97,20 +98,20 @@ def test_prefill_then_batched_decode():
     tokens = {name: torch.randint(0, 96, (seq_len,)) for name in seqs}
     expected = {name: reference(ids[None]).logits[0] for name, ids in tokens.items()}
 
-    # Prefill each sequence: real tokens first, then padding (slot -1).
+    # Prefill each sequence: real tokens first, then padding.
     pad = padded - prompt_len
     for name, blocks in seqs.items():
         ids = torch.cat([tokens[name][:prompt_len], torch.zeros(pad, dtype=torch.long)])
         pos = torch.cat([torch.arange(prompt_len), torch.zeros(pad, dtype=torch.long)])
-        sl = torch.cat([slots(blocks, 0, prompt_len), torch.full((pad,), -1)])
+        sl = torch.cat([slots(blocks, 0, prompt_len), torch.full((pad,), pad_slot)])
         logits = step(backend, ids, pos, sl, torch.tensor([blocks]), padded, list(range(prompt_len)))
         torch.testing.assert_close(logits, expected[name][:prompt_len], rtol=1e-4, atol=1e-4)
 
-    # Decode both sequences, plus a padded batch row (block table -1, slot -1).
+    # Decode both sequences, plus a padded batch row (block table -1).
     block_table = torch.tensor([seqs["a"], seqs["b"], [-1, -1, -1]])
     for t in range(prompt_len, seq_len):
         ids = torch.stack([tokens["a"][t], tokens["b"][t], torch.tensor(0)])
-        sl = torch.cat([slots(seqs["a"], t, 1), slots(seqs["b"], t, 1), torch.tensor([-1])])
+        sl = torch.cat([slots(seqs["a"], t, 1), slots(seqs["b"], t, 1), torch.tensor([pad_slot])])
         logits = step(backend, ids, torch.tensor([t, t, 0]), sl, block_table, 1, [0, 1, 2])
         torch.testing.assert_close(logits[0], expected["a"][t], rtol=1e-4, atol=1e-4)
         torch.testing.assert_close(logits[1], expected["b"][t], rtol=1e-4, atol=1e-4)
@@ -123,14 +124,25 @@ def test_segmented_prefill():
     reference = reference_model(tiny_config())
     backend = backend_model(reference)
     torch.manual_seed(2)
-    blocks, ids = [4, 8, 1], torch.randint(0, 96, (10,))
+    blocks, ids = [4, 8, 1], torch.randint(0, 96, (11,))
     expected = reference(ids[None]).logits[0]
     step(backend, ids[:4], torch.arange(4), slots(blocks, 0, 4), torch.tensor([blocks]), 4, [3])
     logits = step(
-        backend, ids[4:], torch.arange(4, 10), slots(blocks, 4, 6), torch.tensor([blocks]), 6,
+        backend, ids[4:10], torch.arange(4, 10), slots(blocks, 4, 6), torch.tensor([blocks]), 6,
         list(range(6)), kv_segment_size=8,
     )
-    torch.testing.assert_close(logits, expected[4:], rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(logits, expected[4:10], rtol=1e-4, atol=1e-4)
+    # Then decode from the state the chunks left.
+    logits = step(backend, ids[10:], torch.tensor([10]), slots(blocks, 10, 1), torch.tensor([blocks]), 1, [0])
+    torch.testing.assert_close(logits[0], expected[10], rtol=1e-4, atol=1e-4)
+
+
+def test_conv_cache_keeps_kernel_size_minus_one_inputs_per_block():
+    backend = backend_model(reference_model(tiny_config()))
+    conv_layers = [layer for layer in backend.get_kv_spec().layers if layer.key_only]
+    assert len(conv_layers) == 2
+    for layer in conv_layers:  # conv_L_cache 3: 2 inputs of width 64 per block
+        assert layer.num_kv_heads * BLOCK_SIZE * layer.head_size == 2 * 64
 
 
 @pytest.mark.parametrize("num_tokens", [2, 12])  # gathered (2*2*2 <= 8) and dense experts

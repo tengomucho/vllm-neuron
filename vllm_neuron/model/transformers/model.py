@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import AttentionInterface, AutoModelForCausalLM, PretrainedConfig
 from transformers.integrations.moe import ExpertsInterface, batched_mm_experts_forward
+from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import get_tp_group
 
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, paged_slot_indices
@@ -193,16 +194,38 @@ def _is_short_conv(module: nn.Module) -> bool:
     )
 
 
+def _conv_state_head_size(width: int, num_entries: int, block_size: int) -> int:
+    """Row width of a key-only cache block that holds ``num_entries`` vectors of ``width``.
+
+    A block has ``block_size`` rows. Each vector takes the largest number of
+    rows that divides ``width`` and still fits ``num_entries`` vectors per block.
+    """
+    if block_size < num_entries:
+        raise ValueError(
+            f"A KV-cache block of {block_size} tokens cannot hold the "
+            f"{num_entries} inputs of a short-convolution state."
+        )
+    rows = max(r for r in range(1, block_size // num_entries + 1) if width % r == 0)
+    return width // rows
+
+
 class _PagedShortConv(nn.Module):
     """An LFM2 short convolution whose state lives in the paged cache.
 
-    The transformers module keeps a per-sequence conv state (the last
-    ``kernel_size - 1`` inputs of the convolution). Here, each token's
-    convolution input ``B * x`` is written to a key-only paged cache instead, at
-    the token's slot, as attention writes its keys. Each token then reads its
-    ``kernel_size`` window (its predecessors and itself) back through its
-    sequence's block table. Prefill, segmented prefill and batched decode all
-    take this one path, and the cache is managed by vLLM like a KV cache.
+    The transformers module keeps a per-sequence conv state: the last
+    ``kernel_size - 1`` inputs ``B * x`` of the convolution. Here the state goes
+    to a key-only paged cache, which vLLM manages like a KV cache, through the
+    sequence's block table. Each block keeps ``kernel_size - 1`` entries: the
+    input at position ``p`` goes to entry ``p % (kernel_size - 1)`` of the block
+    that holds ``p``. That is ``(kernel_size - 1) / block_size`` of the memory
+    of a cache with one entry per token.
+
+    A step writes the last ``kernel_size - 1`` tokens of each sequence. Each
+    token takes its window (its predecessors and itself) from the step's own
+    tokens, and reads from the cache only the positions before the step. Those
+    are the last positions the sequence wrote, so no later position of their
+    block has replaced them. Prefill, segmented prefill and batched decode all
+    take this one path.
     """
 
     def __init__(self, short_conv: nn.Module):
@@ -223,37 +246,69 @@ class _PagedShortConv(nn.Module):
         b, c, x = self.in_proj(hidden_states[0]).chunk(3, dim=-1)  # [T, W] each
         bx = b * x
         num_tokens, width = bx.shape
+        kernel_size = self.conv.kernel_size[0]
+        num_entries = kernel_size - 1
 
-        cache = self.conv_cache  # [num_blocks, 1, block_size, W]
-        num_blocks, block_size = cache.shape[0], meta["block_size"]
-        block_indices, position_indices = paged_slot_indices(
-            meta["slot_mapping"], block_size, num_blocks
-        )
-        _write_kv(cache, bx.view(1, 1, num_tokens, width), block_indices, position_indices)
+        cache = self.conv_cache  # [num_blocks, 1, block_size, width // rows]
+        num_blocks, _, block_size, row_width = cache.shape
+        rows = width // row_width  # cache rows per entry
+        if num_entries * rows > block_size:
+            raise ValueError(
+                f"The conv cache was laid out for another block size than {block_size}."
+            )
+        row_offsets = torch.arange(rows, device=bx.device)
 
         block_table = meta["block_table_tensor"]
+        slot_mapping = meta["slot_mapping"]
         if meta["max_query_len"] <= meta["decode_token_threshold"]:
             # Decode: the tokens of each sequence are contiguous, one row each.
             seq_len = num_tokens // block_table.shape[0]
-            seq = torch.arange(num_tokens, device=bx.device) // seq_len
         else:
             # A prefill step schedules a single sequence.
-            seq = torch.zeros(num_tokens, dtype=torch.long, device=bx.device)
-        kernel_size = self.conv.kernel_size[0]
-        offsets = torch.arange(kernel_size - 1, -1, -1, device=bx.device)
-        window_pos = neuron_positions.view(-1, 1) - offsets  # [T, K]: p-K+1 .. p
-        valid = window_pos >= 0
-        window_pos = window_pos.clamp(min=0)
-        blocks = block_table[seq.unsqueeze(1), window_pos // block_size].to(torch.long)
-        # Unused block-table entries hold -1; their positions are not read.
-        slots = torch.where(blocks < 0, 0, blocks) * block_size + window_pos % block_size
-        window = cache.view(-1, width).index_select(0, slots.reshape(-1))
-        window = window.view(num_tokens, kernel_size, width) * valid.unsqueeze(-1)
+            seq_len = num_tokens
+        seq = torch.arange(num_tokens, device=bx.device) // seq_len
+        positions = neuron_positions.view(-1)
+        step_start = positions[seq * seq_len]  # first position of the sequence in the step
 
-        weight = self.conv.weight[:, 0, :]  # [W, K], depthwise
-        out = (window.to(weight.dtype) * weight.t().unsqueeze(0)).sum(1)
+        def entry_rows(blocks: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+            """The cache rows of the entry of ``pos`` in ``blocks``: [T, rows]."""
+            first = blocks * block_size + (pos % num_entries) * rows
+            return first.unsqueeze(-1) + row_offsets
+
+        # Depthwise causal convolution; tap kernel_size - 1 is the token itself.
+        weight = self.conv.weight[:, 0, :].float()  # [W, K]
+        out = bx.float() * weight[:, -1]
+        rows_view = cache.view(-1, row_width)
+        for lag in range(1, kernel_size):
+            pos = positions - lag
+            in_step = torch.cat([bx.new_zeros(lag, width), bx])[:num_tokens]
+            safe_pos = pos.clamp(min=0)
+            blocks = block_table[seq, safe_pos // block_size].to(torch.long)
+            # Unused block-table entries hold -1; their positions are not read.
+            blocks = torch.where(blocks < 0, 0, blocks)
+            cached = rows_view.index_select(0, entry_rows(blocks, safe_pos).reshape(-1))
+            cached = cached.view(num_tokens, width) * (pos >= 0).unsqueeze(-1)
+            value = torch.where((pos >= step_start).unsqueeze(-1), in_step, cached.to(bx.dtype))
+            out = out + value.float() * weight[:, -1 - lag]
         if self.conv.bias is not None:
-            out = out + self.conv.bias
+            out = out + self.conv.bias.float()
+
+        # After the reads, keep the last num_entries tokens of each sequence:
+        # the others go to the null block, so that no entry is written twice.
+        # Padding writes to the null block 0 (or to slot -1).
+        real = (slot_mapping >= block_size) & (slot_mapping < num_blocks * block_size)
+        real_ahead = torch.cat([real[num_entries:], real.new_zeros(num_entries)])
+        seq_ahead = torch.cat([seq[num_entries:], seq.new_full((num_entries,), -1)])
+        last = real & ~(real_ahead[:num_tokens] & (seq_ahead[:num_tokens] == seq))
+        blocks, _ = paged_slot_indices(
+            torch.where(last, slot_mapping, -1), block_size, num_blocks
+        )
+        _write_kv(
+            cache,
+            bx.reshape(1, 1, num_tokens * rows, row_width),
+            blocks.to(torch.long).repeat_interleave(rows),
+            (entry_rows(torch.zeros_like(blocks), positions)).reshape(-1),
+        )
         return self.out_proj(c * out.to(c.dtype)).unsqueeze(0)
 
 
@@ -500,10 +555,17 @@ def _model_kwargs(hf_config: PretrainedConfig) -> dict:
 class TransformersForCausalLM(nn.Module):
     """A transformers ``*ForCausalLM`` behind the vLLM Neuron runner interface."""
 
-    def __init__(self, hf_config: PretrainedConfig, neuron_config: NeuronConfig | None):
+    def __init__(
+        self,
+        hf_config: PretrainedConfig,
+        neuron_config: NeuronConfig | None,
+        block_size: int = 32,
+    ):
         super().__init__()
         self.config = hf_config
         self.neuron_config = neuron_config
+        # The KV-cache block size, which lays out the short-convolution state.
+        self.block_size = block_size
         # The dtype is read back from self.model rather than kept as an
         # attribute: Dynamo's precompile cache replaces, by object id, every
         # non-tensor module attribute it does not guard on, and a torch.dtype
@@ -526,7 +588,8 @@ class TransformersForCausalLM(nn.Module):
     def from_configs(
         cls, hf_config: PretrainedConfig, neuron_config: NeuronConfig | None
     ):
-        return cls(hf_config, neuron_config)
+        block_size = get_current_vllm_config().cache_config.block_size
+        return cls(hf_config, neuron_config, block_size)
 
     def _cache_layers(self) -> dict[int, nn.Module]:
         """The modules that keep a paged cache, by layer index: one per decoder
@@ -552,12 +615,16 @@ class TransformersForCausalLM(nn.Module):
         layers = []
         for layer_idx, module in sorted(self._cache_layers().items()):
             if _is_short_conv(module):
-                # One key-only vector per token: the convolution input B * x.
+                # Key-only: the last kernel_size - 1 convolution inputs B * x
+                # per block (see _PagedShortConv).
+                head_size = _conv_state_head_size(
+                    module.conv.in_channels, module.conv.kernel_size[0] - 1, self.block_size
+                )
                 layers.append(
                     LayerSpec(
                         name=_layer_name(layer_idx, "conv"),
                         num_kv_heads=1,
-                        head_size=module.conv.in_channels,
+                        head_size=head_size,
                         dtype=self.model.dtype,
                         key_only=True,
                     )
