@@ -15,8 +15,10 @@ Prototype scope:
 - tensor parallelism from the model's ``base_model_tp_plan`` (``colwise`` and
   ``rowwise`` linear layers; embeddings and LM head stay replicated);
 - causal attention, optionally sliding-window, soft-capped, or with attention
-  sinks, computed with PyTorch ops (no NKI kernels): the KV cache of a
-  sequence is gathered from its block table on each decode step;
+  sinks. Segmented prefill (prompt chunks over the cache) runs vLLM Neuron's
+  segmented attention, an NKI kernel. Single-step prefill and decode use
+  PyTorch ops: the KV cache of a sequence is gathered from its block table on
+  each decode step;
 - LFM2-style hybrids, whose short-convolution layers keep their state in a
   paged cache too;
 - mixture of experts, with the experts sharded over the ranks.
@@ -32,6 +34,7 @@ from transformers.integrations.moe import ExpertsInterface, batched_mm_experts_f
 from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import get_tp_group
 
+import vllm_neuron.functional as NF
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, paged_slot_indices
 from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.nn import Sampler
@@ -91,11 +94,13 @@ def _attend(
     sinks: torch.Tensor | None,
 ) -> torch.Tensor:
     """Masked attention. query [R, Hq, Sq, D], key/value [R, Hkv, Sk, D], allowed [R, Sq, Sk]."""
-    num_groups = query.shape[1] // key.shape[1]
-    if num_groups > 1:
-        key = key.repeat_interleave(num_groups, dim=1)
-        value = value.repeat_interleave(num_groups, dim=1)
-    scores = torch.matmul(query, key.transpose(-1, -2)).float() * scaling
+    num_seqs, num_q_heads, q_len, head_dim = query.shape
+    num_kv_heads, kv_len = key.shape[1], key.shape[2]
+    # Each KV head attends for its group of query heads at once, rather than
+    # K/V being repeated for every query head.
+    grouped = query.reshape(num_seqs, num_kv_heads, -1, head_dim)  # [R, Hkv, G * Sq, D]
+    scores = torch.matmul(grouped, key.transpose(-1, -2)).float() * scaling
+    scores = scores.view(num_seqs, num_q_heads, q_len, kv_len)
     if softcap is not None:
         scores = torch.tanh(scores / softcap) * softcap
     scores = scores.masked_fill(~allowed.unsqueeze(1), torch.finfo(scores.dtype).min)
@@ -105,7 +110,8 @@ def _attend(
         probs = torch.softmax(torch.cat([scores, sink], dim=-1), dim=-1)[..., :-1]
     else:
         probs = torch.softmax(scores, dim=-1)
-    return torch.matmul(probs.to(value.dtype), value)
+    probs = probs.to(value.dtype).view(num_seqs, num_kv_heads, -1, kv_len)
+    return torch.matmul(probs, value).view(num_seqs, num_q_heads, q_len, head_dim)
 
 
 def neuron_paged_attention_forward(
@@ -133,8 +139,11 @@ def neuron_paged_attention_forward(
     - prefill (one sequence, no prior cache): causal attention over the step's
       own tokens; the padding the runner appends comes last, so no real token
       sees it;
-    - decode, or segmented prefill: each sequence attends over its cache,
-      gathered through its block table, up to its own position.
+    - segmented prefill (one sequence, a prompt chunk after those in the
+      cache): vLLM Neuron's segmented attention kernel, which reads the cache
+      in segments of ``kv_segment_size`` tokens;
+    - decode: each sequence attends over its cache, gathered through its block
+      table, up to its own position.
 
     Returns the attention output [1, T, Hq, D].
     """
@@ -152,6 +161,22 @@ def neuron_paged_attention_forward(
     _write_kv(v_cache, value, block_indices, position_indices)
 
     is_decode = meta["max_query_len"] <= meta["decode_token_threshold"]
+    if not is_decode and meta.get("kv_segment_size") and softcap is None:
+        out = NF.segmented_attention(
+            query[0],
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_tables=meta["block_table_tensor"][:1].to(torch.int32),  # one sequence
+            prior_tokens=meta["cached_seq_len"],
+            block_size=block_size,
+            kv_segment_size=meta["kv_segment_size"],
+            scale=scaling,
+            sliding_window=sliding_window,
+            sink=None if s_aux is None else s_aux.view(-1, 1),
+            allow_vector_exp=False,
+        )  # [Hq, T, D]
+        return out.transpose(0, 1).unsqueeze(0), None
+
     if is_decode or meta.get("kv_segment_size"):
         block_table = meta["block_table_tensor"]
         if not is_decode:

@@ -40,7 +40,7 @@ def make_module():
     return module
 
 
-def meta(slot_mapping, block_table, max_query_len, kv_segment_size=0):
+def meta(slot_mapping, block_table, max_query_len, kv_segment_size=0, cached_seq_len=0):
     return {
         "layers.0.self_attn": {
             "slot_mapping": slot_mapping,
@@ -49,6 +49,7 @@ def meta(slot_mapping, block_table, max_query_len, kv_segment_size=0):
             "max_query_len": max_query_len,
             "decode_token_threshold": 1,
             "kv_segment_size": kv_segment_size,
+            "cached_seq_len": torch.tensor([[cached_seq_len]], dtype=torch.int32),
         }
     }
 
@@ -112,7 +113,8 @@ def test_prefill_then_batched_decode(window):
         assert torch.isfinite(out[:, 2]).all()
 
 
-def test_segmented_prefill():
+@pytest.mark.parametrize("window", [None, 4])
+def test_segmented_prefill(window):
     """A second prefill chunk attends over the first one through the cache."""
     torch.manual_seed(0)
     module = make_module()
@@ -125,7 +127,8 @@ def test_segmented_prefill():
         v[:, :4],
         meta(slots(blocks, 0, 4), torch.tensor([blocks]), 4),
         torch.arange(4),
+        window,
     )
-    md = meta(slots(blocks, 4, 6), torch.tensor([blocks]), 6, kv_segment_size=8)
-    out = run(module, q[:, 4:], k[:, 4:], v[:, 4:], md, torch.arange(4, 10))
-    torch.testing.assert_close(out, reference(q, k, v)[:, 4:])
+    md = meta(slots(blocks, 4, 6), torch.tensor([blocks]), 6, kv_segment_size=8, cached_seq_len=4)
+    out = run(module, q[:, 4:], k[:, 4:], v[:, 4:], md, torch.arange(4, 10), window)
+    torch.testing.assert_close(out, reference(q, k, v, window)[:, 4:])

@@ -80,6 +80,8 @@ def step(backend, input_ids, positions, slot_mapping, block_table, max_query_len
         "max_query_len": max_query_len,
         "decode_token_threshold": 1,
         "kv_segment_size": kv_segment_size,
+        # A prefill step schedules one sequence, from its first position.
+        "cached_seq_len": positions[:1].view(1, 1).to(torch.int32),
     }
     attn_metadata = {layer.name: meta for layer in backend.get_kv_spec().layers}
     return backend(
