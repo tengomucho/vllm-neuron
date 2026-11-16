@@ -31,7 +31,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import AttentionInterface, AutoModelForCausalLM, PretrainedConfig
 from transformers.integrations.moe import ExpertsInterface, batched_mm_experts_forward
-from vllm.config import get_current_vllm_config
+from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.distributed.parallel_state import get_tp_group
 
 import vllm_neuron.functional as NF
@@ -223,14 +223,19 @@ def _conv_state_head_size(width: int, num_entries: int, block_size: int) -> int:
     """Row width of a key-only cache block that holds ``num_entries`` vectors of ``width``.
 
     A block has ``block_size`` rows. Each vector takes the largest number of
-    rows that divides ``width`` and still fits ``num_entries`` vectors per block.
+    rows that divides ``width`` and ``block_size`` and still fits ``num_entries``
+    vectors per block, so that a block is also a whole number of vectors.
     """
     if block_size < num_entries:
         raise ValueError(
             f"A KV-cache block of {block_size} tokens cannot hold the "
             f"{num_entries} inputs of a short-convolution state."
         )
-    rows = max(r for r in range(1, block_size // num_entries + 1) if width % r == 0)
+    rows = max(
+        r
+        for r in range(1, block_size // num_entries + 1)
+        if width % r == 0 and block_size % r == 0
+    )
     return width // rows
 
 
@@ -281,7 +286,10 @@ class _PagedShortConv(nn.Module):
             raise ValueError(
                 f"The conv cache was laid out for another block size than {block_size}."
             )
-        row_offsets = torch.arange(rows, device=bx.device)
+        # One row per entry: a read or a write is one indirect copy per token,
+        # not one per cache row.
+        entries_per_block = block_size // rows
+        entries = cache.view(num_blocks, entries_per_block, width)
 
         block_table = meta["block_table_tensor"]
         slot_mapping = meta["slot_mapping"]
@@ -295,15 +303,10 @@ class _PagedShortConv(nn.Module):
         positions = neuron_positions.view(-1)
         step_start = positions[seq * seq_len]  # first position of the sequence in the step
 
-        def entry_rows(blocks: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
-            """The cache rows of the entry of ``pos`` in ``blocks``: [T, rows]."""
-            first = blocks * block_size + (pos % num_entries) * rows
-            return first.unsqueeze(-1) + row_offsets
-
         # Depthwise causal convolution; tap kernel_size - 1 is the token itself.
         weight = self.conv.weight[:, 0, :].float()  # [W, K]
         out = bx.float() * weight[:, -1]
-        rows_view = cache.view(-1, row_width)
+        flat_entries = entries.view(-1, width)
         for lag in range(1, kernel_size):
             pos = positions - lag
             in_step = torch.cat([bx.new_zeros(lag, width), bx])[:num_tokens]
@@ -311,8 +314,10 @@ class _PagedShortConv(nn.Module):
             blocks = block_table[seq, safe_pos // block_size].to(torch.long)
             # Unused block-table entries hold -1; their positions are not read.
             blocks = torch.where(blocks < 0, 0, blocks)
-            cached = rows_view.index_select(0, entry_rows(blocks, safe_pos).reshape(-1))
-            cached = cached.view(num_tokens, width) * (pos >= 0).unsqueeze(-1)
+            cached = flat_entries.index_select(
+                0, blocks * entries_per_block + safe_pos % num_entries
+            )
+            cached = cached * (pos >= 0).unsqueeze(-1)
             value = torch.where((pos >= step_start).unsqueeze(-1), in_step, cached.to(bx.dtype))
             out = out + value.float() * weight[:, -1 - lag]
         if self.conv.bias is not None:
@@ -328,11 +333,8 @@ class _PagedShortConv(nn.Module):
         blocks, _ = paged_slot_indices(
             torch.where(last, slot_mapping, -1), block_size, num_blocks
         )
-        _write_kv(
-            cache,
-            bx.reshape(1, 1, num_tokens * rows, row_width),
-            blocks.to(torch.long).repeat_interleave(rows),
-            (entry_rows(torch.zeros_like(blocks), positions)).reshape(-1),
+        entries.index_put_(
+            (blocks.to(torch.long), positions % num_entries), bx.to(cache.dtype)
         )
         return self.out_proj(c * out.to(c.dtype)).unsqueeze(0)
 
@@ -584,13 +586,15 @@ class TransformersForCausalLM(nn.Module):
         self,
         hf_config: PretrainedConfig,
         neuron_config: NeuronConfig | None,
-        block_size: int = 32,
+        cache_config: CacheConfig | None = None,
     ):
         super().__init__()
         self.config = hf_config
         self.neuron_config = neuron_config
-        # The KV-cache block size, which lays out the short-convolution state.
-        self.block_size = block_size
+        # Its block size lays out the short-convolution state. The platform
+        # settles it after the model is built (update_block_size_for_backend),
+        # so get_kv_spec reads it, not this constructor.
+        self.cache_config = cache_config
         # The dtype is read back from self.model rather than kept as an
         # attribute: Dynamo's precompile cache replaces, by object id, every
         # non-tensor module attribute it does not guard on, and a torch.dtype
@@ -613,8 +617,7 @@ class TransformersForCausalLM(nn.Module):
     def from_configs(
         cls, hf_config: PretrainedConfig, neuron_config: NeuronConfig | None
     ):
-        block_size = get_current_vllm_config().cache_config.block_size
-        return cls(hf_config, neuron_config, block_size)
+        return cls(hf_config, neuron_config, get_current_vllm_config().cache_config)
 
     def _cache_layers(self) -> dict[int, nn.Module]:
         """The modules that keep a paged cache, by layer index: one per decoder
@@ -637,13 +640,14 @@ class TransformersForCausalLM(nn.Module):
 
     def get_kv_spec(self) -> KVSpec:
         text_config = self.config.get_text_config()
+        block_size = self.cache_config.block_size if self.cache_config else 32
         layers = []
         for layer_idx, module in sorted(self._cache_layers().items()):
             if _is_short_conv(module):
                 # Key-only: the last kernel_size - 1 convolution inputs B * x
                 # per block (see _PagedShortConv).
                 head_size = _conv_state_head_size(
-                    module.conv.in_channels, module.conv.kernel_size[0] - 1, self.block_size
+                    module.conv.in_channels, module.conv.kernel_size[0] - 1, block_size
                 )
                 layers.append(
                     LayerSpec(

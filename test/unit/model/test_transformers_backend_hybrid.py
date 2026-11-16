@@ -13,6 +13,7 @@ import threading
 import pytest
 import torch
 from transformers import AutoModelForCausalLM, Lfm2MoeConfig
+from vllm.config import CacheConfig
 
 from vllm_neuron.model.transformers.model import (
     TransformersForCausalLM,
@@ -55,7 +56,9 @@ def reference_model(config: Lfm2MoeConfig) -> torch.nn.Module:
 
 
 def backend_model(reference: torch.nn.Module) -> TransformersForCausalLM:
-    backend = TransformersForCausalLM(copy.deepcopy(reference.config), None, BLOCK_SIZE)
+    backend = TransformersForCausalLM(
+        copy.deepcopy(reference.config), None, CacheConfig(block_size=BLOCK_SIZE)
+    )
     backend.model.float()  # the backend defaults to bf16
     backend.model.load_state_dict(reference.state_dict())
     _use_paged_short_convs(backend.model)
@@ -145,6 +148,15 @@ def test_conv_cache_keeps_kernel_size_minus_one_inputs_per_block():
     assert len(conv_layers) == 2
     for layer in conv_layers:  # conv_L_cache 3: 2 inputs of width 64 per block
         assert layer.num_kv_heads * BLOCK_SIZE * layer.head_size == 2 * 64
+
+
+def test_conv_cache_follows_a_block_size_set_after_the_model_is_built():
+    # The platform sets the Neuron block size once the model is loaded.
+    backend = backend_model(reference_model(tiny_config()))
+    backend.cache_config.block_size = 2 * BLOCK_SIZE
+    conv = next(layer for layer in backend.get_kv_spec().layers if layer.key_only)
+    # Still 2 inputs of width 64 per block, over twice the rows.
+    assert 2 * BLOCK_SIZE * conv.head_size == 2 * 64
 
 
 @pytest.mark.parametrize("num_tokens", [2, 12])  # gathered (2*2*2 <= 8) and dense experts
