@@ -286,10 +286,10 @@ class _PagedShortConv(nn.Module):
             raise ValueError(
                 f"The conv cache was laid out for another block size than {block_size}."
             )
-        # One row per entry: a read or a write is one indirect copy per token,
+        # Reads take an entry as one row of a view: one indirect copy per token,
         # not one per cache row.
         entries_per_block = block_size // rows
-        entries = cache.view(num_blocks, entries_per_block, width)
+        flat_entries = cache.view(num_blocks * entries_per_block, width)
 
         block_table = meta["block_table_tensor"]
         slot_mapping = meta["slot_mapping"]
@@ -306,7 +306,6 @@ class _PagedShortConv(nn.Module):
         # Depthwise causal convolution; tap kernel_size - 1 is the token itself.
         weight = self.conv.weight[:, 0, :].float()  # [W, K]
         out = bx.float() * weight[:, -1]
-        flat_entries = entries.view(-1, width)
         for lag in range(1, kernel_size):
             pos = positions - lag
             in_step = torch.cat([bx.new_zeros(lag, width), bx])[:num_tokens]
@@ -323,18 +322,28 @@ class _PagedShortConv(nn.Module):
         if self.conv.bias is not None:
             out = out + self.conv.bias.float()
 
-        # After the reads, keep the last num_entries tokens of each sequence:
-        # the others go to the null block, so that no entry is written twice.
-        # Padding writes to the null block 0 (or to slot -1).
+        # After the reads, write the last num_entries real tokens of each
+        # sequence, straight into the cache: a write through the view would
+        # copy the whole cache back. The runner pads after the real tokens,
+        # with the null block 0 (or slot -1); a sequence with fewer real tokens
+        # sends the missing writes to the null block.
+        num_seqs = num_tokens // seq_len
         real = (slot_mapping >= block_size) & (slot_mapping < num_blocks * block_size)
-        real_ahead = torch.cat([real[num_entries:], real.new_zeros(num_entries)])
-        seq_ahead = torch.cat([seq[num_entries:], seq.new_full((num_entries,), -1)])
-        last = real & ~(real_ahead[:num_tokens] & (seq_ahead[:num_tokens] == seq))
-        blocks, _ = paged_slot_indices(
-            torch.where(last, slot_mapping, -1), block_size, num_blocks
+        num_real = real.view(num_seqs, seq_len).sum(-1, keepdim=True)
+        local = num_real - 1 - torch.arange(num_entries, device=bx.device)  # [S, E]
+        first = torch.arange(num_seqs, device=bx.device).unsqueeze(-1) * seq_len
+        tokens = (first + local.clamp(min=0)).reshape(-1)
+        slots = torch.where(
+            (local >= 0).reshape(-1), slot_mapping.index_select(0, tokens), -1
         )
-        entries.index_put_(
-            (blocks.to(torch.long), positions % num_entries), bx.to(cache.dtype)
+        blocks, _ = paged_slot_indices(slots, block_size, num_blocks)
+        entry = positions.index_select(0, tokens) % num_entries
+        row_offsets = torch.arange(rows, device=bx.device)
+        _write_kv(
+            cache,
+            bx.index_select(0, tokens).reshape(1, 1, -1, row_width),
+            blocks.to(torch.long).repeat_interleave(rows),
+            ((entry * rows).unsqueeze(-1) + row_offsets).reshape(-1),
         )
         return self.out_proj(c * out.to(c.dtype)).unsqueeze(0)
 
